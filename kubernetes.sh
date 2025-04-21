@@ -156,12 +156,15 @@ echo -e "${GREEN}$(get_k8s_version)${NC}"
 echo -e "${YELLOW}Evaluating OpenShift Deployment...${NC}"
 
 # Basic resource stats
-echo -e "Quantity of Nodes: ${GREEN}$(kubectl get nodes --no-headers | wc -l)${NC}"
-echo -e "Master Nodes:       ${GREEN}$(kubectl get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l)${NC}"
-echo -e "Worker Nodes:       ${GREEN}$(kubectl get nodes --no-headers 2>/dev/null | grep -v master | wc -l)${NC}"
-echo -e "Pods:               ${GREEN}$(get_resource_count pods)${NC}"
-echo -e "Deployments:        ${GREEN}$(get_resource_count deployments)${NC}"
-echo -e "Services:           ${GREEN}$(get_resource_count services)${NC}"
+echo -e "Quantity of Nodes:   ${GREEN}$(kubectl get nodes --no-headers | wc -l)${NC}"
+echo -e "Master Nodes:        ${GREEN}$(kubectl get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l)${NC}"
+echo -e "Worker Nodes:        ${GREEN}$(kubectl get nodes --no-headers 2>/dev/null | grep -v master | wc -l)${NC}"
+echo -e "Pods:                ${GREEN}$(get_resource_count pods)${NC}"
+echo -e "Deployments:         ${GREEN}$(get_resource_count deployments)${NC}"
+echo -e "Services:            ${GREEN}$(get_resource_count services)${NC}"
+echo -e "LoadBalancers:       ${GREEN}$(kubectl get svc --all-namespaces --field-selector spec.type=LoadBalancer --no-headers | wc -l)${NC}"
+echo -e "Operators Installed: ${GREEN}$(kubectl get csv --all-namespaces --no-headers 2>/dev/null | wc -l)${NC}"
+echo -e "DaemonSets:          ${GREEN}$(get_resource_count daemonsets)${NC}"
 
 # Networks check
 if kubectl api-resources | grep -qw networks; then
