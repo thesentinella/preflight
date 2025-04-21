@@ -108,7 +108,7 @@ summarize_node_usage() {
 # Pods per node
 summarize_pods_per_node() {
     echo -e "\nPod Distribution per Node:"
-    kubectl get pods -A -o wide --no-headers | awk '{print $8}' | sort | uniq -c | sort -nr | awk '{printf "  %s: %s pods\n", $2, $1}'
+    kubectl get pods -A -o json | jq -r '.items[].spec.nodeName' | sort | uniq -c | sort -nr | awk '{printf "  %s: %s pods\n", $2, $1}'
 }
 
 # Top CPU/memory pods
@@ -162,7 +162,7 @@ echo -e "Worker Nodes:        ${GREEN}$(kubectl get nodes --no-headers 2>/dev/nu
 echo -e "Pods:                ${GREEN}$(get_resource_count pods)${NC}"
 echo -e "Deployments:         ${GREEN}$(get_resource_count deployments)${NC}"
 echo -e "Services:            ${GREEN}$(get_resource_count services)${NC}"
-echo -e "LoadBalancers:       ${GREEN}$(kubectl get svc --all-namespaces --field-selector spec.type=LoadBalancer --no-headers | wc -l)${NC}"
+echo -e "LoadBalancers:       ${GREEN}$(kubectl get svc -A -o=jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}/{.metadata.name}: {.status.loadBalancer.ingress[0].ip}{"\n"}{end}' | wc -l)${NC}"
 echo -e "Operators Installed: ${GREEN}$(kubectl get csv --all-namespaces --no-headers 2>/dev/null | wc -l)${NC}"
 echo -e "DaemonSets:          ${GREEN}$(get_resource_count daemonsets)${NC}"
 
@@ -199,4 +199,3 @@ summarize_resourcequotas
 # Done
 echo -e "\n${YELLOW}Evaluation Completed."
 echo -e "Output saved to preflight_out.log${NC}"
-
