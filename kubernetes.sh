@@ -31,12 +31,86 @@ for cmd in kubectl jq awk; do
     fi
 done
 
-# Helpers
+# Prefer oc if present (works as kubectl superset on OCP)
+OCCMD="kubectl"
+if command -v oc &>/dev/null; then OCCMD="oc"; fi
+
+# Detect if this is an OpenShift cluster (config.openshift.io group exists)
+is_openshift() {
+    $OCCMD api-resources --api-group=config.openshift.io &>/dev/null
+}
+
+# --- Helpers (Kubernetes) ---
 get_resource_count() { kubectl get "$1" --all-namespaces --no-headers 2>/dev/null | wc -l; }
 get_k8s_version() { kubectl version -o json 2>/dev/null | jq -r '.serverVersion.gitVersion'; }
 get_storage_classes() { kubectl get storageclass -o custom-columns=":metadata.name" --no-headers; }
 get_volume_snapshot_support() { kubectl get volumesnapshotclass &>/dev/null && echo "Supported" || echo "Not Supported"; }
 metrics_available() { kubectl top nodes &>/dev/null; return $?; }
+
+# --- Helpers (OpenShift) ---
+get_ocp_version() {
+    $OCCMD get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null
+}
+get_cluster_name() {
+    # infrastructureName is the canonical "cluster name"/infra ID used by OCP/Clouds
+    $OCCMD get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null
+}
+get_base_domain() {
+    # May be empty in some installs; printed only if present
+    $OCCMD get dns cluster -o jsonpath='{.spec.baseDomain}' 2>/dev/null
+}
+get_apps_domain() {
+    # Default apps route domain (e.g., apps.<basedomain>)
+    $OCCMD get ingress.config.openshift.io/cluster -o jsonpath='{.spec.domain}' 2>/dev/null
+}
+print_cluster_operators() {
+    # Summary counts + per-operator availability/progress/degraded
+    local json out
+    json="$($OCCMD get co -o json 2>/dev/null)" || return 0
+    if [ -z "$json" ]; then return 0; fi
+    echo -e "\nClusterOperators state:"
+    echo "$json" | jq -r '
+      .items[]
+      | .metadata.name as $n
+      | (.status.conditions[]? | select(.type=="Available")   | .status) as $a
+      | (.status.conditions[]? | select(.type=="Progressing") | .status) as $p
+      | (.status.conditions[]? | select(.type=="Degraded")    | .status) as $d
+      | "\($n): Available=\($a) Progressing=\($p) Degraded=\($d)"
+    ' | sed "s/^/  /"
+
+    echo -e "\nClusterOperators summary:"
+    echo "$json" | jq -r '
+      [ .items[]
+        | {
+            a: (.status.conditions[]? | select(.type=="Available")   | .status),
+            p: (.status.conditions[]? | select(.type=="Progressing") | .status),
+            d: (.status.conditions[]? | select(.type=="Degraded")    | .status)
+          }
+      ]
+      | {
+          available_true:   ([.[] | select(.a=="True")]      | length),
+          progressing_true: ([.[] | select(.p=="True")]      | length),
+          degraded_true:    ([.[] | select(.d=="True")]      | length)
+        }
+      | "  Available=True: \(.available_true)\n  Progressing=True: \(.progressing_true)\n  Degraded=True: \(.degraded_true)"
+    '
+}
+
+print_installed_olm_operators() {
+    # OLM-installed operator CSVs
+    if ! $OCCMD api-resources | grep -q '^clusterserviceversions'; then
+        echo -e "\nInstalled OLM Operators: ${YELLOW}Not Available (OLM not detected)${NC}"
+        return
+    fi
+    echo -e "\nInstalled OLM Operators (ClusterServiceVersions):"
+    $OCCMD get csv -A -o json 2>/dev/null \
+      | jq -r '
+          .items[]
+          | "\(.metadata.namespace)/\(.metadata.name)\t\(.spec.displayName // .metadata.name)\t\(.spec.version // "n/a")\t\(.status.phase // "n/a")"
+        ' \
+      | awk -F'\t' 'BEGIN{printf "  %-40s %-45s %-15s %-10s\n", "Namespace/Name", "DisplayName", "Version", "Phase"}
+                    {printf "  %-40s %-45s %-15s %-10s\n", $1, $2, $3, $4}'
+}
 
 # PVC summary
 summarize_pvcs() {
@@ -155,8 +229,30 @@ echo -e "${GREEN}$(get_k8s_version)${NC}"
 
 echo -e "${YELLOW}Evaluating OpenShift Deployment...${NC}"
 
+# --- OpenShift details (if available) ---
+if is_openshift; then
+    ocp_ver="$(get_ocp_version)"
+    infra_name="$(get_cluster_name)"
+    base_domain="$(get_base_domain)"
+    apps_domain="$(get_apps_domain)"
+
+    echo -e "OpenShift Version:   ${GREEN}${ocp_ver:-Unknown}${NC}"
+    echo -e "Cluster Name (infra):${GREEN}${infra_name:-Unknown}${NC}"
+    if [ -n "$base_domain" ]; then
+        echo -e "Base Domain:         ${GREEN}${base_domain}${NC}"
+    fi
+    if [ -n "$apps_domain" ]; then
+        echo -e "Apps Route Domain:   ${GREEN}${apps_domain}${NC}"
+    fi
+
+    print_cluster_operators
+    print_installed_olm_operators
+else
+    echo -e "${YELLOW}(config.openshift.io not detected — skipping OpenShift-specific details)${NC}"
+fi
+
 # Basic resource stats
-echo -e "Quantity of Nodes:   ${GREEN}$(kubectl get nodes --no-headers | wc -l)${NC}"
+echo -e "\nNode quantity:   ${GREEN}$(kubectl get nodes --no-headers | wc -l)${NC}"
 echo -e "Master Nodes:        ${GREEN}$(kubectl get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l)${NC}"
 echo -e "Worker Nodes:        ${GREEN}$(kubectl get nodes --no-headers 2>/dev/null | grep -v master | wc -l)${NC}"
 echo -e "Pods:                ${GREEN}$(get_resource_count pods)${NC}"
@@ -172,7 +268,7 @@ if kubectl api-resources | grep -qw networks; then
 else
     networks="Not Available"
 fi
-echo -e "Networks:           ${GREEN}${networks}${NC}"
+echo -e "Networks:            ${GREEN}${networks}${NC}"
 
 # Storage classes
 echo -e "\nStorage Classes:"
