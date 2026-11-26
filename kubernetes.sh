@@ -9,6 +9,10 @@ else
     echo "Install oc or kubectl to run preflight." >&2
     exit 1
 fi
+if [[ ${1:-} == --planning ]]; then
+    shift
+    exec python3 "$(dirname "$0")/planning.py" "$cli" "$@"
+fi
 command -v jq >/dev/null || { echo "jq is required." >&2; exit 1; }
 
 # Only rendered report lines reach the log. Keep raw API objects in pipelines.
