@@ -1,297 +1,147 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -o pipefail
 
-# Color setup for terminal
-if [ -t 1 ]; then
-    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+if command -v oc >/dev/null; then
+    cli=oc
+elif command -v kubectl >/dev/null; then
+    cli=kubectl
 else
-    RED=''; GREEN=''; YELLOW=''; BLUE=''; NC=''
+    echo "Install oc or kubectl to run preflight." >&2
+    exit 1
 fi
+command -v jq >/dev/null || { echo "jq is required." >&2; exit 1; }
 
-# Spinner (only in terminal)
-show_spinner() {
-    if [ ! -t 1 ]; then return; fi
-    local pid=$1 delay=0.1 spinstr='|/-\'
-    while ps -p $pid &>/dev/null; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
+# Only rendered report lines reach the log. Keep raw API objects in pipelines.
+umask 077
+report() {
+    local title=$1 filter=$2 result
+    shift 2
+    printf '\n%s\n' "$title"
+    if result=$("$cli" --request-timeout=30s "$@" | jq -er "$jq_helpers $filter"); then
+        printf '%s\n' "$result"
+    else
+        echo "  Unavailable (see diagnostic above)"
+        return 1
+    fi
+}
+
+jq_helpers='
+    def condition($type):
+        ([.status.conditions[]? | select(.type == $type) | .status][0] // "Unknown");
+    def rows: if length == 0 then "  None" else .[] | "  " + @tsv end;
+    def quantity:
+        tostring as $raw | ($raw | capture("^(?<n>[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?)(?<u>Ki|Mi|Gi|Ti|Pi|Ei|[numkMGTPE]?)$")) // error("Invalid resource quantity: " + $raw)
+        | (.n | tonumber) * ({"":1,n:1e-9,u:1e-6,m:0.001,k:1000,M:1e6,G:1e9,T:1e12,P:1e15,E:1e18,
+            Ki:1024,Mi:1048576,Gi:1073741824,Ti:1099511627776,Pi:1125899906842624,Ei:1152921504606846976}[.u]);
+    def rounded: . * 1000 | round / 1000;
+'
+
+ocp_report() {
+    report "OpenShift release" '
+        "  Desired version: " + (.status.desired.version // "Unknown"),
+        "  Channel: " + (.spec.channel // "Unset"),
+        "  Progressing: " + condition("Progressing")' get clusterversions.config.openshift.io version -o json
+    report "Infrastructure" '
+        "  Infra ID: " + (.status.infrastructureName // "Unknown"),
+        "  Platform: " + (.status.platformStatus.type // .status.platform // "Unknown"),
+        "  Control-plane topology: " + (.status.controlPlaneTopology // "Unknown")' get infrastructures.config.openshift.io cluster -o json
+    report "Base domain" '.spec.baseDomain // "Unknown"' get dnses.config.openshift.io cluster -o json
+    report "Apps route domain" '.spec.domain // "Unknown"' get ingresses.config.openshift.io cluster -o json
+    report "Cluster network" '
+        "  Plugin: " + (.status.networkType // .spec.networkType // "Unknown"),
+        "  Pod CIDRs: " + ([.spec.clusterNetwork[]?.cidr] | join(", ")),
+        "  Service CIDRs: " + ([.spec.serviceNetwork[]?] | join(", "))' get networks.config.openshift.io cluster -o json
+    report "ClusterOperators" '
+        [.items[] | [.metadata.name, condition("Available"), condition("Progressing"), condition("Degraded")]] as $ops
+        | "  NAME\tAVAILABLE\tPROGRESSING\tDEGRADED", ($ops | rows),
+          "  Available=True: \([$ops[] | select(.[1]=="True")] | length)  Progressing=True: \([$ops[] | select(.[2]=="True")] | length)  Degraded=True: \([$ops[] | select(.[3]=="True")] | length)"' get clusteroperators.config.openshift.io -o json
+    report "MachineConfigPools" '
+        "  POOL\tMACHINES\tREADY\tUPDATED\tDEGRADED\tUPDATING\tPAUSED",
+        ([.items[] | [.metadata.name, .status.machineCount, .status.readyMachineCount,
+          .status.updatedMachineCount, .status.degradedMachineCount, condition("Updating"), (.spec.paused // false)]] | rows)' get machineconfigpools.machineconfiguration.openshift.io -o json
+}
+
+main() {
+    echo "Sentinella Preflight"
+    printf 'Context: '
+    "$cli" config current-context || echo "Unknown"
+    report "Kubernetes server version" '.serverVersion.gitVersion' version -o json || return 1
+
+    local discovery resource count
+    if discovery=$("$cli" --request-timeout=30s api-resources -o name); then
+        if grep -Fxq 'clusterversions.config.openshift.io' <<< "$discovery"; then
+            ocp_report
+        fi
+        if grep -Fxq 'clusterserviceversions.operators.coreos.com' <<< "$discovery"; then
+            report "Installed OLM operators (CSV objects)" '
+                "  CSV count: \(.items | length)", "  NAMESPACE\tCSV\tDISPLAY NAME\tVERSION\tPHASE",
+                ([.items[] | [.metadata.namespace,.metadata.name,.spec.displayName,.spec.version,.status.phase]] | rows)' get clusterserviceversions.operators.coreos.com -A -o json
+        fi
+        while IFS= read -r resource; do
+            [[ $resource == networks || $resource == networks.* ]] || continue
+            report "Networks ($resource)" '.items | length' get "$resource" -A -o json
+        done <<< "$discovery"
+    else
+        echo "API discovery unavailable. OpenShift, OLM and network inventory skipped."
+    fi
+
+    report "Nodes" '
+        def roles: (.metadata.labels // {} | keys | map(select(startswith("node-role.kubernetes.io/")) | split("/")[1]));
+        def control: roles | any(. == "master" or . == "control-plane");
+        "  Nodes: \(.items | length)  Control-plane: \([.items[] | select(control)] | length)  Non-control-plane: \([.items[] | select(control | not)] | length)",
+        "  NAME\tROLES\tREADY\tCORDONED\tZONE\tKUBELET\tARCH\tALLOC CPU\tALLOC MEMORY",
+        ([.items[] | [.metadata.name,(roles | join(",")),condition("Ready"),(.spec.unschedulable // false),
+          (.metadata.labels["topology.kubernetes.io/zone"] // "-"),.status.nodeInfo.kubeletVersion,
+          .status.nodeInfo.architecture,.status.allocatable.cpu,.status.allocatable.memory]] | rows)' get nodes -o json
+
+    report "Pods" '
+        "  Pods: \(.items | length)",
+        "Pod distribution (node, count)",
+        (.items | group_by(.spec.nodeName) | map([.[0].spec.nodeName // "(unassigned)",length]) | rows),
+        "Pending pods (scheduling reason, count)",
+        ([.items[] | select(.status.phase=="Pending")
+          | ([.status.conditions[]? | select(.type=="PodScheduled" and .status=="False") | .reason][0] // "Unknown")]
+          | group_by(.) | map([.[0],length]) | rows),
+        "Regular container totals by namespace (all pod phases)",
+        "  NAMESPACE\tREQ CPU (cores)\tREQ MEM (MiB)\tLIMIT CPU (cores)\tLIMIT MEM (MiB)",
+        (.items | group_by(.metadata.namespace) | map(
+            .[0].metadata.namespace as $ns
+            | reduce (.[].spec.containers[]?.resources) as $r ([0,0,0,0];
+                .[0] += (($r.requests.cpu // 0) | quantity) |
+                .[1] += (($r.requests.memory // 0) | quantity) / 1048576 |
+                .[2] += (($r.limits.cpu // 0) | quantity) |
+                .[3] += (($r.limits.memory // 0) | quantity) / 1048576)
+            | [$ns] + map(rounded)) | rows)' get pods -A -o json
+
+    report "Services" '"  Total: \(.items | length)  LoadBalancers: \([.items[] | select(.spec.type=="LoadBalancer")] | length)"' get services -A -o json
+    for resource in deployments daemonsets jobs cronjobs crds; do
+        if count=$("$cli" --request-timeout=30s get "$resource" -A --no-headers -o custom-columns=NAME:.metadata.name | awk 'NF {n++} END {print n+0}'); then
+            printf '%s: %s\n' "$resource" "$count"
+        else
+            printf '%s: Unavailable\n' "$resource"
+        fi
     done
-    printf "      \b\b\b\b\b\b"
+    for resource in limitranges resourcequotas; do
+        report "$resource by namespace" '.items | group_by(.metadata.namespace) | map([.[0].metadata.namespace,length]) | rows' get "$resource" -A -o json
+    done
+    report "Storage classes (name, provisioner, binding mode)" '
+        [.items[] | [.metadata.name,.provisioner,(.volumeBindingMode // "Immediate")]] | rows' get storageclasses -o json
+    report "PVCs by class (class, count, requested GiB, pending)" '
+        .items | group_by(.spec.storageClassName // "") | map([
+            (.[0].spec.storageClassName | if . == null or . == "" then "(none)" else . end), length,
+            (map((.spec.resources.requests.storage // 0) | quantity) | add / 1073741824 | rounded),
+            (map(select(.status.phase=="Pending")) | length)]) | rows' get pvc -A -o json
+    report "VolumeSnapshotClasses (name, driver, deletion policy)" '
+        [.items[] | [.metadata.name,.driver,.deletionPolicy]] | rows' get volumesnapshotclasses.snapshot.storage.k8s.io -o json
+    printf '\nNode usage (CPU and memory, absolute and percent)\n'
+    "$cli" --request-timeout=30s top nodes || echo "  Node metrics unavailable"
+    report "Top pod consumers" '
+        [.items[] | [.metadata.namespace + "/" + .metadata.name,
+          ([.containers[].usage.cpu | quantity] | add // 0),
+          ([.containers[].usage.memory | quantity] | add // 0)]] as $pods
+        | "Top 5 CPU (millicores)", ($pods | sort_by(-.[1],.[0]) | .[:5] | map([.[0],(.[1]*1000 | rounded)]) | rows),
+          "Top 5 memory (MiB)", ($pods | sort_by(-.[2],.[0]) | .[:5] | map([.[0],(.[2]/1048576 | rounded)]) | rows)' get --raw /apis/metrics.k8s.io/v1beta1/pods
+    echo
+    echo "Evaluation completed. Output saved to preflight_out.log"
 }
-
-# Requirements check
-for cmd in kubectl jq awk; do
-    if ! command -v $cmd &>/dev/null; then
-        echo -e "${RED}$cmd is required but not installed.${NC}"
-        [[ -f /etc/redhat-release ]] && echo -e "${YELLOW}Try: sudo dnf install $cmd${NC}"
-        [[ -f /etc/debian_version ]] && echo -e "${YELLOW}Try: sudo apt install $cmd${NC}"
-        exit 1
-    fi
-done
-
-# Prefer oc if present (works as kubectl superset on OCP)
-OCCMD="kubectl"
-if command -v oc &>/dev/null; then OCCMD="oc"; fi
-
-# Detect if this is an OpenShift cluster (config.openshift.io group exists)
-is_openshift() {
-    $OCCMD api-resources --api-group=config.openshift.io &>/dev/null
-}
-
-# --- Helpers (Kubernetes) ---
-get_resource_count() { kubectl get "$1" --all-namespaces --no-headers 2>/dev/null | wc -l; }
-get_k8s_version() { kubectl version -o json 2>/dev/null | jq -r '.serverVersion.gitVersion'; }
-get_storage_classes() { kubectl get storageclass -o custom-columns=":metadata.name" --no-headers; }
-get_volume_snapshot_support() { kubectl get volumesnapshotclass &>/dev/null && echo "Supported" || echo "Not Supported"; }
-metrics_available() { kubectl top nodes &>/dev/null; return $?; }
-
-# --- Helpers (OpenShift) ---
-get_ocp_version() {
-    $OCCMD get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null
-}
-get_cluster_name() {
-    # infrastructureName is the canonical "cluster name"/infra ID used by OCP/Clouds
-    $OCCMD get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null
-}
-get_base_domain() {
-    # May be empty in some installs; printed only if present
-    $OCCMD get dns cluster -o jsonpath='{.spec.baseDomain}' 2>/dev/null
-}
-get_apps_domain() {
-    # Default apps route domain (e.g., apps.<basedomain>)
-    $OCCMD get ingress.config.openshift.io/cluster -o jsonpath='{.spec.domain}' 2>/dev/null
-}
-print_cluster_operators() {
-    # Summary counts + per-operator availability/progress/degraded
-    local json out
-    json="$($OCCMD get co -o json 2>/dev/null)" || return 0
-    if [ -z "$json" ]; then return 0; fi
-    echo -e "\nClusterOperators state:"
-    echo "$json" | jq -r '
-      .items[]
-      | .metadata.name as $n
-      | (.status.conditions[]? | select(.type=="Available")   | .status) as $a
-      | (.status.conditions[]? | select(.type=="Progressing") | .status) as $p
-      | (.status.conditions[]? | select(.type=="Degraded")    | .status) as $d
-      | "\($n): Available=\($a) Progressing=\($p) Degraded=\($d)"
-    ' | sed "s/^/  /"
-
-    echo -e "\nClusterOperators summary:"
-    echo "$json" | jq -r '
-      [ .items[]
-        | {
-            a: (.status.conditions[]? | select(.type=="Available")   | .status),
-            p: (.status.conditions[]? | select(.type=="Progressing") | .status),
-            d: (.status.conditions[]? | select(.type=="Degraded")    | .status)
-          }
-      ]
-      | {
-          available_true:   ([.[] | select(.a=="True")]      | length),
-          progressing_true: ([.[] | select(.p=="True")]      | length),
-          degraded_true:    ([.[] | select(.d=="True")]      | length)
-        }
-      | "  Available=True: \(.available_true)\n  Progressing=True: \(.progressing_true)\n  Degraded=True: \(.degraded_true)"
-    '
-}
-
-print_installed_olm_operators() {
-    # OLM-installed operator CSVs
-    if ! $OCCMD api-resources | grep -q '^clusterserviceversions'; then
-        echo -e "\nInstalled OLM Operators: ${YELLOW}Not Available (OLM not detected)${NC}"
-        return
-    fi
-    echo -e "\nInstalled OLM Operators (ClusterServiceVersions):"
-    $OCCMD get csv -A -o json 2>/dev/null \
-      | jq -r '
-          .items[]
-          | "\(.metadata.namespace)/\(.metadata.name)\t\(.spec.displayName // .metadata.name)\t\(.spec.version // "n/a")\t\(.status.phase // "n/a")"
-        ' \
-      | awk -F'\t' 'BEGIN{printf "  %-40s %-45s %-15s %-10s\n", "Namespace/Name", "DisplayName", "Version", "Phase"}
-                    {printf "  %-40s %-45s %-15s %-10s\n", $1, $2, $3, $4}'
-}
-
-# PVC summary
-summarize_pvcs() {
-    echo -e "\nPVCs per StorageClass:"
-    kubectl get pvc --all-namespaces -o json | jq -r '
-        .items[] |
-        select(.spec.storageClassName != null) |
-        "\(.spec.storageClassName) \(.spec.resources.requests.storage)"
-    ' | awk '{
-        sc=$1; sz=$2;
-        if (sz ~ /Gi$/) g=substr(sz,1,length(sz)-2);
-        else if (sz ~ /Mi$/) g=sprintf("%.2f",substr(sz,1,length(sz)-2)/1024);
-        else g=0;
-        count[sc]++; size[sc]+=g;
-    } END {
-        for (sc in count)
-            printf "  %s: %d PVCs, %.2f GiB\n", sc, count[sc], size[sc];
-    }'
-}
-
-# Resource requests & limits
-summarize_requests_limits() {
-    echo -e "\nResource Requests & Limits (CPU & Memory) per Namespace:"
-    kubectl get pods --all-namespaces -o json |
-    jq -r '
-        .items[] |
-        select(.spec.containers != null) |
-        .metadata.namespace as $ns |
-        .spec.containers[]? |
-        select(.resources != null) |
-        [$ns, (.resources.requests.cpu // "0"), (.resources.requests.memory // "0"), (.resources.limits.cpu // "0"), (.resources.limits.memory // "0")] |
-        @tsv
-    ' | awk -F '\t' '
-        {
-            ns=$1;
-            reqcpu=$2; reqmem=$3; limcpu=$4; limmem=$5;
-            gsub(/[^0-9.]/,"",reqcpu); gsub(/[^0-9.]/,"",reqmem);
-            gsub(/[^0-9.]/,"",limcpu); gsub(/[^0-9.]/,"",limmem);
-            if ($3 ~ /Gi/) reqmem *= 1024;
-            if ($5 ~ /Gi/) limmem *= 1024;
-            rcpu[ns]+=reqcpu; rmem[ns]+=reqmem;
-            lcpu[ns]+=limcpu; lmem[ns]+=limmem;
-        } END {
-            printf "%-20s %-10s %-10s %-10s %-10s\n", "Namespace", "ReqCPU", "ReqMemMi", "LimCPU", "LimMemMi";
-            for (ns in rcpu)
-                printf "%-20s %-10.2f %-10.2f %-10.2f %-10.2f\n", ns, rcpu[ns], rmem[ns], lcpu[ns], lmem[ns];
-        }
-    '
-}
-
-# Pending pods
-summarize_pending_pods() {
-    echo -e "\nPending Pods and Reasons:"
-    kubectl get pods --all-namespaces --field-selector=status.phase=Pending -o json |
-    jq -r '.items[] | [.metadata.namespace, .metadata.name, (.status.conditions[]? | select(.type=="PodScheduled") | .reason // "Unknown")] | @tsv' |
-    awk -F '\t' '{count[$3]++} END {for (r in count) printf "  %s: %d\n", r, count[r]; if (NR==0) print "  None"}'
-}
-
-# Node usage vs allocatable
-summarize_node_usage() {
-    echo -e "\nNode Resource Usage vs Allocatable:"
-    if metrics_available; then
-        kubectl top nodes --no-headers | awk '{printf "  %-25s CPU: %s / %s  |  Memory: %s / %s\n", $1, $2, $3, $4, $5}'
-    else
-        echo "  Not Available – metrics server not installed"
-    fi
-}
-
-# Pods per node
-summarize_pods_per_node() {
-    echo -e "\nPod Distribution per Node:"
-    kubectl get pods -A -o json | jq -r '.items[].spec.nodeName' | sort | uniq -c | sort -nr | awk '{printf "  %s: %s pods\n", $2, $1}'
-}
-
-# Top CPU/memory pods
-summarize_top_consumers() {
-    echo -e "\nTop 5 Pods by CPU Usage:"
-    if metrics_available; then
-        kubectl top pods --all-namespaces --sort-by=cpu --no-headers | head -n 5 | awk '{printf "  %s/%s: %s\n", $1, $2, $3}'
-    else
-        echo "  Not Available – metrics server not installed"
-    fi
-
-    echo -e "\nTop 5 Pods by Memory Usage:"
-    if metrics_available; then
-        kubectl top pods --all-namespaces --sort-by=memory --no-headers | head -n 5 | awk '{printf "  %s/%s: %s\n", $1, $2, $4}'
-    else
-        echo "  Not Available – metrics server not installed"
-    fi
-}
-
-# LimitRanges
-summarize_limitranges() {
-    echo -e "\nLimitRanges per Namespace:"
-    kubectl get limitranges --all-namespaces --no-headers 2>/dev/null | awk '{count[$1]++} END {for (ns in count) printf "  %s: %d\n", ns, count[ns]; if (NR==0) print "  None"}'
-}
-
-# ResourceQuotas
-summarize_resourcequotas() {
-    echo -e "\nResourceQuotas per Namespace:"
-    kubectl get resourcequotas --all-namespaces --no-headers 2>/dev/null | awk '{count[$1]++} END {for (ns in count) printf "  %s: %d\n", ns, count[ns]; if (NR==0) print "  None"}'
-}
-
-# Redirect output to log
-exec > >(tee -i preflight_out.log)
-exec 2>&1
-
-# Header
-echo -e "${BLUE}=============================="
-echo -e "     Sentinella Preflight"
-echo -e "==============================${NC}"
-
-# Kubernetes version
-echo -n "Kubernetes Version: "
-echo -e "${GREEN}$(get_k8s_version)${NC}"
-
-echo -e "${YELLOW}Evaluating OpenShift Deployment...${NC}"
-
-# --- OpenShift details (if available) ---
-if is_openshift; then
-    ocp_ver="$(get_ocp_version)"
-    infra_name="$(get_cluster_name)"
-    base_domain="$(get_base_domain)"
-    apps_domain="$(get_apps_domain)"
-
-    echo -e "OpenShift Version:   ${GREEN}${ocp_ver:-Unknown}${NC}"
-    echo -e "Cluster Name (infra):${GREEN}${infra_name:-Unknown}${NC}"
-    if [ -n "$base_domain" ]; then
-        echo -e "Base Domain:         ${GREEN}${base_domain}${NC}"
-    fi
-    if [ -n "$apps_domain" ]; then
-        echo -e "Apps Route Domain:   ${GREEN}${apps_domain}${NC}"
-    fi
-
-    print_cluster_operators
-    print_installed_olm_operators
-else
-    echo -e "${YELLOW}(config.openshift.io not detected — skipping OpenShift-specific details)${NC}"
-fi
-
-# Basic resource stats
-echo -e "\nNode quantity:   ${GREEN}$(kubectl get nodes --no-headers | wc -l)${NC}"
-echo -e "Master Nodes:        ${GREEN}$(kubectl get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l)${NC}"
-echo -e "Worker Nodes:        ${GREEN}$(kubectl get nodes --no-headers 2>/dev/null | grep -v master | wc -l)${NC}"
-echo -e "Pods:                ${GREEN}$(get_resource_count pods)${NC}"
-echo -e "Deployments:         ${GREEN}$(get_resource_count deployments)${NC}"
-echo -e "Services:            ${GREEN}$(get_resource_count services)${NC}"
-echo -e "LoadBalancers:       ${GREEN}$(kubectl get svc -A -o=jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}/{.metadata.name}: {.status.loadBalancer.ingress[0].ip}{"\n"}{end}' | wc -l)${NC}"
-echo -e "Operators Installed: ${GREEN}$(kubectl get csv --all-namespaces --no-headers 2>/dev/null | wc -l)${NC}"
-echo -e "DaemonSets:          ${GREEN}$(get_resource_count daemonsets)${NC}"
-
-# Networks check
-if kubectl api-resources | grep -qw networks; then
-    networks=$(get_resource_count networks)
-else
-    networks="Not Available"
-fi
-echo -e "Networks:            ${GREEN}${networks}${NC}"
-
-# Storage classes
-echo -e "\nStorage Classes:"
-get_storage_classes | while read -r sc; do
-    echo -e "  ${GREEN}${sc}${NC}"
-done
-
-# Storage + CRDs
-summarize_pvcs
-echo -e "\nVolumeSnapshotClass Support: ${GREEN}$(get_volume_snapshot_support)${NC}"
-echo -e "CRDs: ${GREEN}$(kubectl get crds --no-headers 2>/dev/null | wc -l)${NC}"
-echo -e "Jobs: ${GREEN}$(get_resource_count jobs)${NC}"
-echo -e "CronJobs: ${GREEN}$(get_resource_count cronjobs)${NC}"
-
-# Extended insights
-summarize_requests_limits
-summarize_pending_pods
-summarize_node_usage
-summarize_pods_per_node
-summarize_top_consumers
-summarize_limitranges
-summarize_resourcequotas
-
-# Done
-echo -e "\n${YELLOW}Evaluation Completed."
-echo -e "Output saved to preflight_out.log${NC}"
+main 2>&1 | tee preflight_out.log
